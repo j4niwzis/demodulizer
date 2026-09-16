@@ -31,6 +31,24 @@ export std::string header_for(std::string_view module_name,
   return made;
 }
 
+// What a path's last part is, what holds it, and what it is called without
+// its extension. `llvm/Support/Path.h` has these and the module wrapper does
+// not carry them; they are three lines each and no dependency at all.
+std::string_view leaf_of(std::string_view path) {
+  const std::size_t at = path.rfind('/');
+  return at == std::string_view::npos ? path : path.substr(at + 1);
+}
+
+std::string_view holding_of(std::string_view path) {
+  const std::size_t at = path.rfind('/');
+  return at == std::string_view::npos ? std::string_view{} : path.substr(0, at);
+}
+
+std::string_view without_extension(std::string_view leaf) {
+  const std::size_t at = leaf.rfind('.');
+  return (at == std::string_view::npos || at == 0) ? leaf : leaf.substr(0, at);
+}
+
 // Every `#define` the file makes, so that every one of them can be taken back
 // at the end of the header.
 //
@@ -202,12 +220,11 @@ export class headers_used {
   }
 
   static std::string from_module_source(llvm::StringRef path) {
-    llvm::StringRef leaf = llvm::sys::path::filename(path);
+    const std::string_view whole(path.data(), path.size());
+    const std::string_view leaf = leaf_of(whole);
     if (!leaf.ends_with(".inc")) return {};
-    if (llvm::sys::path::filename(llvm::sys::path::parent_path(path)) != "std") {
-      return {};
-    }
-    return leaf.drop_back(4).str();
+    if (leaf_of(holding_of(whole)) != "std") return {};
+    return std::string(leaf.substr(0, leaf.size() - 4));
   }
 
   const clang::SourceManager& sm_;
@@ -486,27 +503,39 @@ export class to_a_header : public clang::ASTConsumer {
     headers_used used(sm, ci_.getPreprocessor().getHeaderSearchInfo());
     walk(ctx, said, used).TraverseDecl(ctx.getTranslationUnitDecl());
 
-    clang::Rewriter rewriter(sm, ctx.getLangOpts());
-    // The `export` keyword goes, and the whitespace after it stays: what is
+    // What comes out, as offsets into the file it came from.
+    //
+    // clang has a rewriter for this and the module wrapper does not carry it,
+    // which costs nothing here: all that happens is that a few runs of
+    // characters leave one buffer, and an offset with a length says that as
+    // plainly as a source range does.
+    std::vector<std::pair<unsigned, unsigned>> taken_out;
+    const auto token_length = [&](clang::SourceLocation at) {
+      return clang::Lexer::MeasureTokenLength(at, sm, ctx.getLangOpts());
+    };
+    // The `export` keyword goes and the whitespace after it stays: what is
     // left is `namespace scan {`, which is what a header says.
     for (const clang::SourceRange& one : said.exports) {
-      const unsigned length = clang::Lexer::MeasureTokenLength(
-          one.getBegin(), sm, ctx.getLangOpts());
-      rewriter.ReplaceText(one.getBegin(), length, "");
+      taken_out.emplace_back(sm.getFileOffset(one.getBegin()),
+                             token_length(one.getBegin()));
     }
-    // Imports become includes, but at the top rather than in place: a header
-    // says what it needs before it needs it.
+    // An import goes entirely, semicolon and all; what it asked for is said
+    // again at the top, because a header says what it needs before it needs
+    // it.
     for (const clang::SourceRange& one : said.imports) {
-      rewriter.RemoveText(clang::CharSourceRange::getTokenRange(
-          one.getBegin(), through_semicolon(one.getEnd(), sm, ctx)));
+      const clang::SourceLocation semi =
+          through_semicolon(one.getEnd(), sm, ctx);
+      const unsigned from = sm.getFileOffset(one.getBegin());
+      const unsigned upto = sm.getFileOffset(semi) + token_length(semi);
+      if (upto > from) taken_out.emplace_back(from, upto - from);
     }
 
-    std::string body;
-    if (const llvm::RewriteBuffer* out =
-            rewriter.getRewriteBufferFor(sm.getMainFileID())) {
-      body.assign(out->begin(), out->end());
-    } else {
-      body = sm.getBufferData(sm.getMainFileID()).str();
+    std::string body = sm.getBufferData(sm.getMainFileID()).str();
+    // Back to front, so that taking one run out does not move the next.
+    std::ranges::sort(taken_out, std::ranges::greater{},
+                      &std::pair<unsigned, unsigned>::first);
+    for (const auto& [at, length] : taken_out) {
+      if (at + length <= body.size()) body.erase(at, length);
     }
     drop_module_declaration(body);
 
@@ -546,8 +575,9 @@ export class to_a_header : public clang::ASTConsumer {
     clang::OptionalFileEntryRef from =
         sm.getFileEntryRefForID(sm.getMainFileID());
     if (!from) return;
-    llvm::StringRef path = from->getName();
-    std::string stem = llvm::sys::path::stem(path).str();
+    const llvm::StringRef path = from->getName();
+    const std::string_view whole(path.data(), path.size());
+    const std::string stem(without_extension(leaf_of(whole)));
     std::string where = plan_.into + "/" + stem + plan_.suffix;
     std::error_code failed;
     llvm::raw_fd_ostream to(where, failed);
