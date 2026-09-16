@@ -13,6 +13,9 @@ jobs:
   # sources are put through the same transformation by hand first.
   bootstrap:
     runs-on: ubuntu-24.04
+    # Only for the tag builds, which attach the binary to a release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -88,11 +91,15 @@ jobs:
         run: |
           wget -qO- https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-x86_64.tar.gz | tar xz
           echo "$PWD/cmake-4.4.3-linux-x86_64/bin" >> "$GITHUB_PATH"
+      # Named by the full path rather than by `clang++-22`: CMake works out
+      # where the `std` module's sources are from the compiler it was given,
+      # and `/usr/bin/clang++-22` leads it to `/lib/share/libc++`, which is
+      # nowhere. `/usr/lib/llvm-22/bin/clang++` leads it to the right place.
       - name: configure and build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=clang++-22 \
-            -DCMAKE_C_COMPILER=clang-22 \
+            -DCMAKE_CXX_COMPILER=/usr/lib/llvm-22/bin/clang++ \
+            -DCMAKE_C_COMPILER=/usr/lib/llvm-22/bin/clang \
             -DCMAKE_CXX_FLAGS="-stdlib=libc++"
           cmake --build build
