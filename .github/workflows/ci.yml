@@ -1,0 +1,83 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The bootstrap build, which is the one that has to work: a tool that turns
+  # modules into headers cannot be built from modules by itself, so its own
+  # sources are put through the same transformation by hand first.
+  bootstrap:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: clang and the libraries it is written against
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y libclang-22-dev llvm-22-dev libc++-22-dev \
+            libc++abi-22-dev
+
+      - name: one translation unit
+        run: python3 bootstrap/make_tu.py
+
+      - name: build
+        run: |
+          clang++-22 -std=c++20 -fno-rtti -O2 \
+            -I"$(llvm-config-22 --includedir)" \
+            -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS \
+            -D__STDC_LIMIT_MACROS \
+            bootstrap/demodulizer_all.cc \
+            -L"$(llvm-config-22 --libdir)" -lclang-cpp -lLLVM-22 \
+            -Wl,-rpath,"$(llvm-config-22 --libdir)" \
+            -o demodulizer
+          ./demodulizer --help 2>&1 | head -3 || true
+
+      - name: what it has to get right
+        run: CXX=clang++-22 TOOL=./demodulizer tests/run.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demodulizer-linux-x86_64
+          path: demodulizer
+
+      - name: attach it to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: demodulizer
+          fail_on_unmatched_files: true
+
+  # The real build, through CMake and `import libtooling;`. Kept separate and
+  # allowed to fail for now: it has never been run, and the bootstrap is what
+  # the release is cut from until it has.
+  modules:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: clang, libc++ and the libraries
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y libclang-22-dev llvm-22-dev libc++-22-dev \
+            libc++abi-22-dev ninja-build
+      - name: a cmake new enough for `import std`
+        run: |
+          wget -qO- https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-x86_64.tar.gz | tar xz
+          echo "$PWD/cmake-4.4.3-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: configure and build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++-22 \
+            -DCMAKE_C_COMPILER=clang-22 \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++"
+          cmake --build build

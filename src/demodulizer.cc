@@ -111,12 +111,6 @@ export class headers_used {
     static const std::set<std::string, std::less<>> kept_quiet = {
         "__config", "__configuration", "__assert", "__verbose_abort",
         "__availability", "__undef_macros", "__config_site", "__debug_utils",
-        // A forward declaration belongs to whatever header declares the thing
-        // for real, and which one that is does not follow from the name:
-        // `__fwd/pair.h` is `<utility>`. Left out rather than guessed at --
-        // anything actually used drags its real header in as well, and the
-        // check that matters is whether the generated header compiles.
-        "__fwd",
         // The C library's own arrangement, reached through a C header that is
         // named in its own right.
         "bits", "sys", "asm", "asm-generic", "linux", "gnu"};
@@ -145,6 +139,22 @@ export class headers_used {
       leaf.remove_suffix(4);
       return std::string(leaf);
     }
+    // A forward declaration is where a type is named without being defined,
+    // and something only declared -- a member never touched in this file --
+    // refers to nothing else. So these cannot be skipped. The name is the
+    // file's, not the directory's, and the few that do not match the header
+    // they belong to are listed.
+    if (head == "__fwd") {
+      static const std::map<std::string, std::string, std::less<>> belongs_to = {
+          {"pair", "utility"},       {"get", "utility"},
+          {"subrange", "ranges"},    {"bit_reference", "bitset"},
+          {"hash", "functional"},    {"byte", "cstddef"},
+      };
+      std::string_view leaf = rest.substr(slash + 1);
+      if (leaf.ends_with(".h")) leaf.remove_suffix(2);
+      auto instead = belongs_to.find(leaf);
+      return instead != belongs_to.end() ? instead->second : std::string(leaf);
+    }
     // Folding a path down to its first part is how this library is laid out
     // and nobody else's: `boost/pfr/core.hpp` is included by that name and by
     // no other. Only what announces itself as internal is folded.
@@ -171,9 +181,24 @@ export class headers_used {
     // `<algorithm>`), which is the arrangement that makes them, so the file's
     // own name answers where the search cannot.
     std::string named = spelled.empty() ? std::string() : public_name(spelled);
+    // Where the search could not shorten the path -- which happens whenever
+    // the flags the tool was given do not name the include directory the file
+    // was found through -- the library root is still recognisable in the path
+    // itself, and everything after it is the name.
+    if (named.empty()) named = public_name(after_library_root(file.getName()));
     if (named.empty()) named = from_module_source(file.getName());
     if (named.empty()) return {};
     return "<" + named + ">";
+  }
+
+  static std::string after_library_root(llvm::StringRef path) {
+    for (llvm::StringRef root : {"/c++/v1/", "/include/c++/"}) {
+      const std::size_t at = path.find(root);
+      if (at != llvm::StringRef::npos) {
+        return path.substr(at + root.size()).str();
+      }
+    }
+    return {};
   }
 
   static std::string from_module_source(llvm::StringRef path) {
@@ -371,8 +396,28 @@ export class walk : public clang::RecursiveASTVisitor<walk> {
                     " each have one\n";
   }
 
+  // An instantiation is recorded where it was instantiated, which is here --
+  // `std::vector<std::string_view>` as a member is written down as belonging
+  // to this file, and asking where it came from would answer this file. The
+  // template it came from is what has a header.
+  static const clang::Decl* where_it_came_from(const clang::Decl* d) {
+    if (const auto* one = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(d)) {
+      return one->getSpecializedTemplate();
+    }
+    if (const auto* one = llvm::dyn_cast<clang::VarTemplateSpecializationDecl>(d)) {
+      return one->getSpecializedTemplate();
+    }
+    if (const auto* one = llvm::dyn_cast<clang::FunctionDecl>(d)) {
+      if (clang::FunctionTemplateDecl* from = one->getPrimaryTemplate()) {
+        return from;
+      }
+    }
+    return d;
+  }
+
   bool note(const clang::Decl* d) {
     if (d == nullptr) return true;
+    d = where_it_came_from(d);
     if (std::getenv("DEMOD_EXPLAIN") != nullptr) {
       if (const auto* named = llvm::dyn_cast<clang::NamedDecl>(d)) {
         llvm::errs() << "  saw " << named->getQualifiedNameAsString() << "\n";

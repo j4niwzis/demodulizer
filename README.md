@@ -70,6 +70,31 @@ once at the definition, which is ill-formed and which a module interface unit
 accepts. Nothing but a header build would have found it.
 
 
+## Building it, and checking it
+
+A tool that turns modules into headers cannot be built from modules by
+itself, so `bootstrap/make_tu.py` puts its own sources through the same
+transformation by hand -- the `export` off, the preamble replaced by includes
+-- and the result is one translation unit that any clang can compile against
+libclang. That is what the release is built from. `CMakeLists.txt` builds it
+the proper way, through `import libtooling;`, and is the second job in CI
+rather than the first.
+
+`tests/run.sh` is what keeps it honest, and every check in it is there because
+that check once failed:
+
+  * an import becomes an include, named by the same rule
+  * `<algorithm>` is named although only a template asks for it
+  * `<vector>` is named although the only mention is a member declaration
+  * the include count stays in single figures rather than naming the whole
+    standard library
+  * the macro the unit defined is taken back
+  * no `export`, `import` or module declaration survives
+  * the headers compile, two translation units including them link, and the
+    program they make gives the right answer
+  * a unit with a definition that would collide is refused with exit 2, and
+    nothing that would not collide is named
+
 ## Licence
 
 This tool is licensed under the GNU Affero General Public License, version 3
