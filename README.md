@@ -72,13 +72,21 @@ accepts. Nothing but a header build would have found it.
 
 ## Building it, and checking it
 
-A tool that turns modules into headers cannot be built from modules by
-itself, so `bootstrap/make_tu.py` puts its own sources through the same
-transformation by hand -- the `export` off, the preamble replaced by includes
--- and the result is one translation unit that any clang can compile against
-libclang. That is what the release is built from. `CMakeLists.txt` builds it
-the proper way, through `import libtooling;`, and is the second job in CI
-rather than the first.
+It is modules all the way, built by CMake against `import libtooling;` and
+`import std;`. Two things about that are not a choice:
+
+  * **libstdc++, not libc++.** It links clang's own libraries, and every
+    prebuilt clang -- apt.llvm.org, the LLVM release tarballs, Alpine's -- is
+    built against libstdc++. Compiled against libc++ instead, every `std` type
+    crossing clang's API would be mangled `std::__1::` and nothing would link.
+    Which standard library it *parses* with is free, and is whatever the flags
+    after `--` say.
+  * **libstdc++ 15 or newer**, because that is the first whose `bits/std.cc`
+    CMake will compile as the `std` module. Hence the container in CI; the
+    runner images ship an older one.
+
+And `-fno-rtti`, which the build sets itself: the prebuilt clang libraries are
+built without it, so their typeinfo symbols do not exist.
 
 `tests/run.sh` is what keeps it honest, and every check in it is there because
 that check once failed:

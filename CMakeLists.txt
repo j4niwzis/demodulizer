@@ -18,10 +18,14 @@ CPMAddPackage(NAME libtooling-wrapper
   GIT_TAG main
   GIT_SHALLOW TRUE)
 
+# The prebuilt clang libraries are built without RTTI, so their typeinfo
+# symbols do not exist; anything that derives from their classes has to be
+# compiled the same way or the link cannot find them.
 add_library(demodulizer_lib STATIC src/demodulizer.cc)
 target_sources(demodulizer_lib PUBLIC FILE_SET CXX_MODULES FILES src/demodulizer.cc)
 target_link_libraries(demodulizer_lib PUBLIC libtooling)
 target_compile_features(demodulizer_lib PUBLIC cxx_std_23)
+target_compile_options(demodulizer_lib PUBLIC -fno-rtti)
 
 add_executable(demodulizer src/main.cc)
 target_link_libraries(demodulizer PRIVATE demodulizer_lib)
