@@ -95,6 +95,14 @@ export class headers_used {
 
   void saw(const clang::Decl* d) {
     if (d == nullptr) return;
+    // A declaration that belongs to a module is named by that module's
+    // import, and that import is answered where it stands -- under whatever
+    // condition it stands under. Spelling its header out here as well would
+    // put it in the file unconditionally, which is the whole of what this
+    // was getting wrong. Only what `import std;` brings is named by headers.
+    if (const clang::Module* from = d->getOwningModule()) {
+      if (from->getTopLevelModuleName() != "std") return;
+    }
     const clang::SourceLocation at = d->getLocation();
     if (!at.isValid()) return;
     const clang::FileID id = sm_.getFileID(sm_.getExpansionLoc(at));
@@ -236,6 +244,47 @@ export class headers_used {
 
 namespace demod {
 
+// An import in a branch the preprocessor did not take.
+//
+// There is no declaration for it -- the AST has nothing the compiler never
+// read -- so the text is where it still is, and the text is where it has to
+// be answered. A header may not say `import` under any condition, and what it
+// should say instead follows from the name alone.
+export template <class saying>
+void say_what_was_skipped(std::string& body, const saying& include_for) {
+  std::string made;
+  std::size_t at = 0;
+  while (at <= body.size()) {
+    const std::size_t eol = body.find('\n', at);
+    const std::size_t end = (eol == std::string::npos) ? body.size() : eol;
+    std::string_view line(body.data() + at, end - at);
+    std::string_view rest = line;
+    while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
+      rest.remove_prefix(1);
+    }
+    if (rest.starts_with("export ")) rest.remove_prefix(7);
+    bool answered = false;
+    if (rest.starts_with("import ") && rest.ends_with(";")) {
+      std::string_view name = rest.substr(7, rest.size() - 8);
+      while (!name.empty() && name.back() == ' ') name.remove_suffix(1);
+      const bool a_name = !name.empty() &&
+                          name.find_first_not_of(
+                              "abcdefghijklmnopqrstuvwxyz"
+                              "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.") ==
+                              std::string_view::npos;
+      if (a_name) {
+        made += include_for(std::string(name));
+        answered = true;
+      }
+    }
+    if (!answered) made.append(line);
+    if (eol == std::string::npos) break;
+    made += '\n';
+    at = eol + 1;
+  }
+  body.swap(made);
+}
+
 // What the file says and where it says it.
 // Where an `import a.b.c;` really ends. The declaration's own range stops at
 // the first identifier -- the rest of the name is kept apart from it -- and
@@ -271,8 +320,7 @@ export int complaints() { return complained; }
 export struct seen {
   std::vector<clang::SourceRange> exports;   // the `export` keyword, alone
   std::vector<clang::SourceRange> imports;   // `import x;`, whole
-  std::set<std::string> modules_imported;    // the names, to become includes
-  bool imports_std = false;
+  std::vector<std::string> imported_names;   // and what each of them named
 };
 
 export class walk : public clang::RecursiveASTVisitor<walk> {
@@ -346,19 +394,12 @@ export class walk : public clang::RecursiveASTVisitor<walk> {
 
   bool VisitImportDecl(clang::ImportDecl* d) {
     if (!here(d->getLocation())) return true;
+    clang::Module* m = d->getImportedModule();
+    if (m == nullptr) return true;
     into_.imports.push_back(d->getSourceRange());
-    std::string named;
-    for (const auto& part : d->getIdentifierLocs()) {
-      (void)part;
-    }
-    if (clang::Module* m = d->getImportedModule()) {
-      named = m->getTopLevelModuleName();
-      if (named == "std") {
-        into_.imports_std = true;
-      } else {
-        into_.modules_imported.insert(m->getFullModuleName());
-      }
-    }
+    into_.imported_names.push_back(m->getTopLevelModuleName() == "std"
+                                       ? std::string("std")
+                                       : m->getFullModuleName());
     return true;
   }
 
@@ -503,13 +544,36 @@ export class to_a_header : public clang::ASTConsumer {
     headers_used used(sm, ci_.getPreprocessor().getHeaderSearchInfo());
     walk(ctx, said, used).TraverseDecl(ctx.getTranslationUnitDecl());
 
+    // What an import becomes, said where the import was.
+    //
+    // Not gathered at the top, which is what this did first and what made it
+    // wrong: an import inside a `#if` the preprocessor skipped is not in the
+    // AST at all, so it stayed in the text as an `import` -- a thing no
+    // header may contain -- while the include it should have become was put
+    // at the top unconditionally, where the other branch would read it. Put
+    // in its place, the condition around it is kept without this having to
+    // understand it.
+    const auto include_for = [&](const std::string& module_name) {
+      if (module_name == "std") {
+        std::string made;
+        for (const std::string& one : used.found()) {
+          made += "#include " + one + "\n";
+        }
+        if (!made.empty()) made.pop_back();
+        return made;
+      }
+      auto told = plan_.spelled_as.find(module_name);
+      if (told != plan_.spelled_as.end()) return "#include " + told->second;
+      return "#include \"" + header_for(module_name, plan_.suffix) + "\"";
+    };
+
     // What comes out, as offsets into the file it came from.
     //
     // clang has a rewriter for this and the module wrapper does not carry it,
     // which costs nothing here: all that happens is that a few runs of
     // characters leave one buffer, and an offset with a length says that as
     // plainly as a source range does.
-    std::vector<std::pair<unsigned, unsigned>> taken_out;
+    std::vector<std::tuple<unsigned, unsigned, std::string>> taken_out;
     const auto token_length = [&](clang::SourceLocation at) {
       return clang::Lexer::MeasureTokenLength(at, sm, ctx.getLangOpts());
     };
@@ -517,34 +581,40 @@ export class to_a_header : public clang::ASTConsumer {
     // left is `namespace scan {`, which is what a header says.
     for (const clang::SourceRange& one : said.exports) {
       taken_out.emplace_back(sm.getFileOffset(one.getBegin()),
-                             token_length(one.getBegin()));
+                             token_length(one.getBegin()), std::string());
     }
     // An import goes entirely, semicolon and all; what it asked for is said
     // again at the top, because a header says what it needs before it needs
     // it.
-    for (const clang::SourceRange& one : said.imports) {
+    for (std::size_t at = 0; at < said.imports.size(); ++at) {
+      const clang::SourceRange& one = said.imports[at];
       const clang::SourceLocation semi =
           through_semicolon(one.getEnd(), sm, ctx);
       const unsigned from = sm.getFileOffset(one.getBegin());
       const unsigned upto = sm.getFileOffset(semi) + token_length(semi);
-      if (upto > from) taken_out.emplace_back(from, upto - from);
+      if (upto > from) {
+        taken_out.emplace_back(from, upto - from,
+                               include_for(said.imported_names[at]));
+      }
     }
 
     std::string body = sm.getBufferData(sm.getMainFileID()).str();
     // Back to front, so that taking one run out does not move the next.
     std::ranges::sort(taken_out, std::ranges::greater{},
-                      &std::pair<unsigned, unsigned>::first);
-    for (const auto& [at, length] : taken_out) {
-      if (at + length <= body.size()) body.erase(at, length);
+                      [](const auto& one) { return std::get<0>(one); });
+    for (const auto& [at, length, with] : taken_out) {
+      if (at + length > body.size()) continue;
+      body.erase(at, length);
+      if (!with.empty()) body.insert(at, with);
     }
     drop_module_declaration(body);
+    // And an import the preprocessor never reached, which is in no AST: the
+    // one thing a header may not carry, left behind by a condition that was
+    // false. The name is all that is needed to say what it should have been.
+    say_what_was_skipped(body, include_for);
 
     std::string made = "// Generated from the module interface unit of the "
-                       "same name. Do not edit.\n#pragma once\n\n";
-    for (const std::string& one : includes_for(said, used)) {
-      made += "#include " + one + "\n";
-    }
-    made += "\n";
+                       "same name. Do not edit.\n#pragma once\n";
     made += body;
     if (!macros_.empty()) {
       made += "\n// A module keeps its macros to itself and a header does not, "
@@ -556,21 +626,6 @@ export class to_a_header : public clang::ASTConsumer {
   }
 
  private:
-  [[nodiscard]] std::vector<std::string> includes_for(
-      const seen& said, const headers_used& used) const {
-    std::set<std::string> all;
-    if (said.imports_std) {
-      for (const std::string& one : used.found()) all.insert(one);
-    }
-    for (const std::string& one : said.modules_imported) {
-      auto told = plan_.spelled_as.find(one);
-      all.insert(told != plan_.spelled_as.end()
-                     ? told->second
-                     : "\"" + header_for(one, plan_.suffix) + "\"");
-    }
-    return {all.begin(), all.end()};
-  }
-
   void write_out(const clang::SourceManager& sm, const std::string& made) const {
     clang::OptionalFileEntryRef from =
         sm.getFileEntryRefForID(sm.getMainFileID());

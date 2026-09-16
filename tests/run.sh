@@ -59,6 +59,12 @@ count=$(grep -c '^#include <' "$work/hdr/fixture_ok.hpp")
 say "includes in fixture_ok.hpp: $count"
 [ "$count" -lt 20 ] || died "$count includes: the walk went into the import"
 
+# And the same for an import the preprocessor never read: it has no
+# declaration to be found by, and leaving it is a header that says `import`.
+awk '/^#if FIXTURE_THE_OTHER_WAY$/{f=1;next} f&&/^#endif$/{exit} f{print}' \
+  "$work/hdr/fixture_ok.hpp" | grep -q '#include "fixture_dep.hpp"' \
+  || died "the import in the branch that was not taken was not answered"
+
 # A module keeps its macros; a header hands them over unless they are taken
 # back.
 grep -q '^#undef FIXTURE_WIDTH' "$work/hdr/fixture_ok.hpp" \

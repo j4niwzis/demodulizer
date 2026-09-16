@@ -4,6 +4,14 @@ export module fixture.ok;
 import std;
 import fixture.dep;
 
+// An import in a branch the preprocessor does not take. There is no
+// declaration for it anywhere -- the compiler never read the line -- and a
+// header may not carry an `import` under any condition, so the answer has to
+// be put where the line is and left under the same condition.
+#if FIXTURE_THE_OTHER_WAY
+import fixture.dep;
+#endif
+
 // Defined here and used here, and taken back at the end of the header: a
 // module keeps its macros and a header hands them over.
 #define FIXTURE_WIDTH 8
