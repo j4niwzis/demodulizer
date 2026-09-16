@@ -24,6 +24,21 @@ jobs:
           sudo apt-get install -y libclang-22-dev llvm-22-dev libc++-22-dev \
             libc++abi-22-dev
 
+      # The packages ship `libclang-cpp.so.22.1` and no `libclang-cpp.so`,
+      # which is the name a `-l` looks for. Said here rather than guessed at
+      # from a version number.
+      - name: names the linker can find
+        run: |
+          d=$(llvm-config-22 --libdir)
+          ls "$d" | grep -E 'libclang-cpp|libLLVM' || true
+          for base in libclang-cpp libLLVM; do
+            if [ ! -e "$d/$base.so" ]; then
+              real=$(ls "$d/$base.so."* 2>/dev/null | head -1)
+              if [ -n "$real" ]; then sudo ln -sf "$real" "$d/$base.so"; fi
+            fi
+          done
+          ls -la "$d"/libclang-cpp.so "$d"/libLLVM.so
+
       - name: one translation unit
         run: python3 bootstrap/make_tu.py
 
@@ -34,10 +49,10 @@ jobs:
             -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS \
             -D__STDC_LIMIT_MACROS \
             bootstrap/demodulizer_all.cc \
-            -L"$(llvm-config-22 --libdir)" -lclang-cpp -lLLVM-22 \
+            -L"$(llvm-config-22 --libdir)" -lclang-cpp -lLLVM \
             -Wl,-rpath,"$(llvm-config-22 --libdir)" \
             -o demodulizer
-          ./demodulizer --help 2>&1 | head -3 || true
+          ./demodulizer --version 2>&1 | head -3 || true
 
       - name: what it has to get right
         run: CXX=clang++-22 TOOL=./demodulizer tests/run.sh
