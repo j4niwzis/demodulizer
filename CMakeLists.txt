@@ -5,7 +5,9 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-project(demodulizer VERSION 0.1 LANGUAGES CXX)
+# C as well as C++: `find_package(LLVM)` checks things by compiling C, and
+# says so only once it is asked to.
+project(demodulizer VERSION 0.1.0 LANGUAGES C CXX)
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
